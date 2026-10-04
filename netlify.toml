@@ -1,0 +1,22 @@
+# Netlify serves the app from the pwa/ folder.
+# config.js in pwa/ already holds the Supabase URL + publishable key, so no build step is needed.
+# To generate config.js from environment variables instead, uncomment the build command and set
+# SUPABASE_URL and SUPABASE_PUBLISHABLE_KEY in Netlify → Site settings → Environment variables.
+[build]
+  publish = "pwa"
+  # command = "node scripts/write-config.mjs"
+
+[[headers]]
+  for = "/sw.js"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/config.js"
+  [headers.values]
+    Cache-Control = "no-cache"
