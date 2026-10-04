@@ -109,10 +109,13 @@
     if (document.querySelector(`script[data-mdt-src="${src}"]`)) return window.supabase ? Promise.resolve() : new Promise((res, rej) => { const s = document.querySelector(`script[data-mdt-src="${src}"]`); s.addEventListener('load', res); s.addEventListener('error', rej); });
     return new Promise((res, rej) => { const s = document.createElement('script'); s.src = src; s.async = true; s.dataset.mdtSrc = src; s.onload = res; s.onerror = () => rej(new Error('Could not load ' + src)); document.head.appendChild(s); });
   }
-  const freshState = uid => ({ uid, linked: false, sig: {}, dirtyAt: {}, files: {}, derived: {}, lastPull: {}, legacyAlt: {}, settingsSig: null });
+  const freshState = uid => ({ uid, linked: false, sig: {}, files: {}, derived: {}, lastPull: {}, legacyAlt: {}, settingsSig: null });
+  // Pending local edits: { recordUuid: ISO time of the edit }. Written by the app the moment a record is saved or deleted,
+  // shared by all tabs (localStorage), cleared only after that exact edit reached the cloud or a newer cloud edit replaced it.
+  const DIRTY_KEY = 'mdt-dirty-v1';
 
   class MDTSync {
-    constructor(cfg) { this.cfg = cfg; this.client = null; this.st = freshState(null); this.allowMassDelete = false; this.blocked = 0; this._q = Promise.resolve(); }
+    constructor(cfg, opts) { this.cfg = cfg; this.store = (opts && opts.store) || (typeof localStorage !== 'undefined' ? localStorage : null); this.client = null; this.st = freshState(null); this.allowMassDelete = false; this.blocked = 0; this._q = Promise.resolve(); }
     async ready() {
       if (this.client) return this.client;
       if (!window.supabase || !window.supabase.createClient) await loadScript(SDK_URL);
@@ -126,15 +129,26 @@
     async signOut() { const c = await this.ready(); await c.auth.signOut(); this.st = freshState(null); }
     // ── per-user sync bookkeeping (localStorage, separate from the app data) ──
     useUser(uid) {
-      let st = null; try { st = JSON.parse(localStorage.getItem(STATE_PREFIX + ':' + uid) || 'null'); } catch (e) {}
+      let st = null; try { st = JSON.parse(this.store.getItem(STATE_PREFIX + ':' + uid) || 'null'); } catch (e) {}
       this.st = st && st.uid === uid ? { ...freshState(uid), ...st } : freshState(uid);
     }
-    save() { if (this.st.uid) try { localStorage.setItem(STATE_PREFIX + ':' + this.st.uid, JSON.stringify(this.st)); } catch (e) {} }
+    save() { if (this.st.uid) try { this.store.setItem(STATE_PREFIX + ':' + this.st.uid, JSON.stringify(this.st)); } catch (e) {} }
+    static readDirty(store) { try { return JSON.parse(store.getItem(DIRTY_KEY) || '{}') || {}; } catch (e) { return {}; } }
+    static markDirty(store, ids, at) {
+      if (!ids || !ids.length) return; const m = MDTSync.readDirty(store), base = at ? time(at) : Date.now();
+      for (const id of ids) m[id] = new Date(Math.max(base, time(m[id]) + 1)).toISOString(); // always newer than this record's previous edit
+      try { store.setItem(DIRTY_KEY, JSON.stringify(m)); } catch (e) {}
+    }
+    static clearDirty(store, id, ts) { const m = MDTSync.readDirty(store); if (m[id] && (!ts || m[id] === ts)) { delete m[id]; try { store.setItem(DIRTY_KEY, JSON.stringify(m)); } catch (e) {} } }
     isLinked() { return !!this.st.linked; }
     reload() { if (this.st.uid) this.useUser(this.st.uid); } // other tabs may have saved newer bookkeeping
     markLinked() { this.reload(); this.st.linked = true; this.save(); }
     resetForCloudCopy() { const uid = this.st.uid; this.st = freshState(uid); this.st.linked = true; this.save(); }
-    restoreMissing() { this.reload(); for (const t of TABLES) this.st.sig[t] = {}; this.st.files = {}; this.st.lastPull = {}; this.blocked = 0; this.save(); }
+    restoreMissing(data) {
+      this.reload(); const live = new Set(), d = MDTSync.readDirty(this.store);
+      ['debts', 'payments', 'borrowings', 'settlements'].forEach(k => ((data || {})[k] || []).forEach(r => r.uuid && live.add(r.uuid)));
+      Object.keys(d).forEach(id => { if (!live.has(id)) MDTSync.clearDirty(this.store, id, d[id]); }); // forget pending deletes so they come back
+      for (const t of TABLES) this.st.sig[t] = {}; this.st.files = {}; this.st.lastPull = {}; this.blocked = 0; this.save(); }
     // Gives every local record a stable UUID. Returns null when nothing changed.
     static ensureIds(data) {
       let changed = false; const out = {};
@@ -146,15 +160,20 @@
       return { debtUuidOf: id => byLocal[id], debtLocalOf: u => byUuid[u] };
     }
     pendingCount(data) {
-      if (!this.st.uid) return 0; const { debtUuidOf } = this.maps(data); let n = 0;
-      for (const t of TABLES) { const sig = this.st.sig[t] || {}, live = new Set(); for (const r of data[LOC[t]] || []) { const row = toRow(t, r, this.st.uid, debtUuidOf); if (!row) { if (!r.uuid) n++; continue; } live.add(row.id); if (sig[row.id] !== rowHash(row)) n++; } n += Object.keys(sig).filter(id => !live.has(id)).length; }
-      return n;
+      const dirty = MDTSync.readDirty(this.store); if (!this.st.uid) return Object.keys(dirty).length;
+      const { debtUuidOf } = this.maps(data), live = new Set(); let n = 0;
+      for (const t of TABLES) { const sig = this.st.sig[t] || {}; for (const r of data[LOC[t]] || []) { if (!r.uuid) { n++; continue; } live.add(r.uuid); const row = toRow(t, r, this.st.uid, debtUuidOf); if (row && (dirty[r.uuid] ? sig[r.uuid] !== rowHash(row) : !sig[r.uuid])) n++; } }
+      return n + Object.keys(dirty).filter(id => !live.has(id)).length;
     }
     async cloudDebtCount() { const c = await this.ready(); const { count, error } = await c.from('debts').select('id', { count: 'exact', head: true }).is('deleted_at', null); if (error) throw error; return count || 0; }
     // One sync at a time across ALL open tabs/windows of the app (Web Locks), always starting from the latest saved bookkeeping.
     run(fn) {
-      const go = () => { this.reload(); return fn(); };
-      const locked = () => (navigator.locks && navigator.locks.request) ? navigator.locks.request('mdt-sync', go) : go();
+      let started = false;
+      const go = () => { started = true; this.reload(); return fn(); };
+      const locked = () => { // falls back to this tab's own queue where the Locks API isn't available
+        try { if (typeof navigator !== 'undefined' && navigator.locks && navigator.locks.request) return navigator.locks.request('mdt-sync', go).catch(e => (started ? Promise.reject(e) : go())); } catch (e) {}
+        return go();
+      };
       const p = this._q.then(locked, locked); this._q = p.catch(() => {}); return p;
     }
     async fetchLive(table, sel) {
@@ -219,34 +238,35 @@
     }
     resetBookkeeping() { this.reload(); const keep = { uid: this.st.uid, linked: this.st.linked, files: this.st.files, settingsSig: this.st.settingsSig }; this.st = { ...freshState(keep.uid), ...keep }; this.save(); }
 
-    // ── pull: remote → local ──
-    async pull(data, receipts) {
-      const c = await this.ready(), uid = this.st.uid, out = { debts: [...(data.debts || [])], payments: [...(data.payments || [])], borrowings: [...(data.borrowings || [])], settlements: [...(data.settlements || [])] };
-      const putReceipts = {}, delReceipts = []; let changed = false, settingsRow = null;
+    // ── pull: cloud → local. Runs AFTER push. A record with a pending local edit is only replaced if the cloud copy is newer. ──
+    async pull(data, receipts, stale = {}) {
+      const c = await this.ready(), uid = this.st.uid, dirty = MDTSync.readDirty(this.store);
+      const out = { debts: [...(data.debts || [])], payments: [...(data.payments || [])], borrowings: [...(data.borrowings || [])], settlements: [...(data.settlements || [])] };
+      const putReceipts = {}, delReceipts = []; let settingsRow = null;
       const fetchAll = async (table, since) => {
         const rows = []; for (let from = 0; ; from += 1000) {
           let q = c.from(table).select('*').order('updated_at', { ascending: true }).range(from, from + 999); if (since) q = q.gte('updated_at', since);
           const { data: got, error } = await q; if (error) throw error; rows.push(...got); if (got.length < 1000) break;
         } return rows;
       };
+      const fetchIds = async (table, ids) => { const rows = []; for (let i = 0; i < ids.length; i += 100) { const { data: got, error } = await c.from(table).select('*').in('id', ids.slice(i, i + 100)); if (error) throw error; rows.push(...got); } return rows; };
       for (const t of TABLES) {
         const arr = out[LOC[t]], sig = this.st.sig[t] || (this.st.sig[t] = {}), rows = await fetchAll(t, this.st.lastPull[t]);
-        let last = this.st.lastPull[t];
+        const last = rows.length ? rows[rows.length - 1].updated_at : this.st.lastPull[t];
+        const seen = new Set(rows.map(r => r.id)), more = (stale[t] || []).filter(id => !seen.has(id));
+        if (more.length) rows.push(...await fetchIds(t, more)); // copies push found out of date
         for (const row of rows) {
-          last = row.updated_at; const m = this.maps(out);
-          const idx = arr.findIndex(r => r.uuid === row.id), local = idx >= 0 ? arr[idx] : null;
-          const localRow = local ? toRow(t, local, uid, m.debtUuidOf) : null, dirty = local && sig[row.id] !== rowHash(localRow);
-          if (local && dirty && time(this.st.dirtyAt[row.id]) > time(row.client_updated_at || row.updated_at)) continue; // newer local edit wins
-          if (row.deleted_at) { if (local) { arr.splice(idx, 1); changed = true; } delete sig[row.id]; delete this.st.dirtyAt[row.id]; continue; }
-          if (!local && sig[row.id]) continue; // deleted on this device, waiting to push
+          const m = this.maps(out), idx = arr.findIndex(r => r.uuid === row.id), local = idx >= 0 ? arr[idx] : null, dts = dirty[row.id];
+          if (dts && time(dts) >= time(row.client_updated_at || row.updated_at)) continue; // pending local edit is newer: keep it
+          if (dts) { MDTSync.clearDirty(this.store, row.id, dts); delete dirty[row.id]; } // cloud edit is newer: newest edit wins
+          if (row.deleted_at) { if (local) arr.splice(idx, 1); delete sig[row.id]; continue; }
           let lid = local ? local.id : null;
           if (!lid) { const base = String((SPEC[t].legacy ? row.legacy_id : (row.extra || {}).id) || '').split('@')[0]; lid = base && !arr.some(r => r.id === base) ? base : PREFIX[t] + String(Math.max(0, ...arr.map(r => parseInt(String(r.id).replace(/\D/g, ''), 10) || 0)) + 1).padStart(4, '0'); }
           const rec = fromRow(t, row, lid, m.debtLocalOf); if (!rec) continue;
           if (SPEC[t].legacy && row.legacy_id && row.legacy_id !== lid) this.st.legacyAlt[row.id] = row.legacy_id;
-          const h = rowHash(toRow(t, rec, uid, m.debtUuidOf));
-          if (local && !dirty && h === sig[row.id]) continue; // our own echo
+          const h = rowHash(toRow(t, rec, uid, m.debtUuidOf)); sig[row.id] = h;
+          if (local && rowHash(toRow(t, local, uid, m.debtUuidOf)) === h) continue; // same content (e.g. our own push coming back)
           if (local) arr[idx] = rec; else arr.push(rec);
-          sig[row.id] = h; delete this.st.dirtyAt[row.id]; changed = true;
         }
         this.st.lastPull[t] = last;
       }
@@ -267,36 +287,69 @@
       this.st.lastPull.attachments = lastA;
       { const { data: s } = await c.from('user_settings').select('*').maybeSingle(); if (s && hash(stable({ m: s.payment_methods, p: s.prefs })) !== this.st.settingsSig) { settingsRow = s; this.st.settingsSig = hash(stable({ m: s.payment_methods, p: s.prefs })); } }
       this.save();
-      return { data: changed ? out : null, putReceipts, delReceipts, settings: settingsRow ? { methods: settingsRow.payment_methods, prefs: settingsRow.prefs } : null };
+      const changes = {};
+      for (const k of ['debts', 'payments', 'borrowings', 'settlements']) {
+        const before = data[k] || [], refs = new Set(before), uu = new Set(out[k].map(r => r.uuid));
+        changes[k] = { up: out[k].filter(r => !refs.has(r)), rm: before.filter(r => r.uuid && !uu.has(r.uuid)).map(r => r.uuid) };
+      }
+      return { changes, putReceipts, delReceipts, settings: settingsRow ? { methods: settingsRow.payment_methods, prefs: settingsRow.prefs } : null };
+    }
+    // Applies pulled changes onto the CURRENT app state (not the snapshot the pull started from). Records edited again meanwhile are left alone.
+    static applyChanges(cur, changes, dirty) {
+      const next = {}; let changed = false;
+      for (const k of ['debts', 'payments', 'borrowings', 'settlements']) {
+        const ch = changes && changes[k]; if (!ch || (!ch.up.length && !ch.rm.length)) continue;
+        const rm = new Set(ch.rm.filter(u => !dirty[u]));
+        const arr = (cur[k] || []).filter(r => !(r.uuid && rm.has(r.uuid)));
+        for (const rec of ch.up) {
+          if (dirty[rec.uuid]) continue;
+          const i = arr.findIndex(r => r.uuid === rec.uuid);
+          if (i >= 0) arr[i] = rec; else arr.push(rec);
+        }
+        next[k] = arr; changed = true;
+      }
+      return changed ? next : null;
     }
 
-    // ── push: local → remote ──
+    // ── push: local → cloud. Runs FIRST. Only records edited on this device (dirty) or never synced are sent. ──
     async push(data, receipts, ctx) {
-      const c = await this.ready(), uid = this.st.uid, now = new Date().toISOString(), m = this.maps(data); let errors = 0;
-      const deletes = {}, remaps = {};
+      const c = await this.ready(), uid = this.st.uid, now = new Date().toISOString(), m = this.maps(data), dirty = MDTSync.readDirty(this.store); let errors = 0;
+      const deletes = {}, remaps = {}, stale = {}, addStale = (t, id) => (stale[t] = stale[t] || []).push(id);
       for (const t of TABLES) {
-        const sig = this.st.sig[t] || (this.st.sig[t] = {}), live = new Set(), rows = [];
+        const sig = this.st.sig[t] || (this.st.sig[t] = {}), live = new Set(), cand = [];
         for (const r of data[LOC[t]] || []) {
           const row = toRow(t, r, uid, m.debtUuidOf); if (!row) continue; live.add(row.id);
-          const h = rowHash(row); if (sig[row.id] === h) continue;
-          if (!this.st.dirtyAt[row.id]) this.st.dirtyAt[row.id] = r.updatedAt && time(r.updatedAt) > 0 ? new Date(r.updatedAt).toISOString() : now;
-          if (this.st.legacyAlt[row.id]) row.legacy_id = this.st.legacyAlt[row.id];
-          row.client_updated_at = this.st.dirtyAt[row.id]; rows.push([row, h]);
+          const h = rowHash(row), dts = dirty[row.id];
+          if (sig[row.id] === h) continue; // unchanged since last sync
+          if (!dts && sig[row.id]) { addStale(t, row.id); continue; } // differs but wasn't edited here: an old copy, refresh it from the cloud
+          cand.push([row, h, dts]);
         }
+        // Newest edit wins: never overwrite a cloud row that was edited after this local edit.
+        const remoteT = {}, ids = cand.map(x => x[0].id);
+        for (let i = 0; i < ids.length; i += 100) { const { data: got, error } = await c.from(t).select('id,client_updated_at,updated_at').in('id', ids.slice(i, i + 100)); if (error) throw error; got.forEach(g => { remoteT[g.id] = time(g.client_updated_at || g.updated_at); }); }
+        const rows = [];
+        for (const [row, h, dts] of cand) {
+          if (row.id in remoteT && remoteT[row.id] > time(dts)) { addStale(t, row.id); continue; }
+          if (this.st.legacyAlt[row.id]) row.legacy_id = this.st.legacyAlt[row.id];
+          row.client_updated_at = dts || now; row.deleted_at = null; rows.push([row, h, dts]);
+        }
+        const done = (row, h, dts) => { sig[row.id] = h; if (dts) MDTSync.clearDirty(this.store, row.id, dts); };
         for (let i = 0; i < rows.length; i += 200) {
           const chunk = rows.slice(i, i + 200), { error } = await c.from(t).upsert(chunk.map(x => x[0]), { onConflict: 'id' });
-          if (!error) { chunk.forEach(([row, h]) => { sig[row.id] = h; delete this.st.dirtyAt[row.id]; }); continue; }
-          for (const [row, h] of chunk) { // retry one by one; a legacy id used on another device gets a suffix
+          if (!error) { chunk.forEach(x => done(...x)); continue; }
+          for (const [row, h, dts] of chunk) { // retry one by one; a legacy id used on another device gets a suffix
             let { error: e1 } = await c.from(t).upsert(row, { onConflict: 'id' });
             if (e1 && e1.code === '23505' && SPEC[t].legacy) {
               const { data: ex } = await c.from(t).select('*').eq('legacy_id', baseLegacy(row.legacy_id)).is('deleted_at', null).limit(1);
               if (ex && ex[0] && ex[0].id !== row.id && sameContent(t, ex[0], row)) { (remaps[t] = remaps[t] || {})[row.id] = ex[0].id; continue; } // same record already in the cloud: reuse it
               row.legacy_id = String(row.legacy_id).split('@')[0] + '@' + row.id.slice(0, 8); this.st.legacyAlt[row.id] = row.legacy_id; ({ error: e1 } = await c.from(t).upsert(row, { onConflict: 'id' })); }
-            if (e1) { errors++; console.warn('[sync]', t, e1.message); } else { sig[row.id] = h; delete this.st.dirtyAt[row.id]; }
+            if (e1) { errors++; console.warn('[sync]', t, e1.message); } else done(row, h, dts);
           }
         }
-        deletes[t] = Object.keys(sig).filter(id => !live.has(id));
-        if (remaps[t]) { this.save(); return { errors, blocked: 0, remaps }; } // the app re-points these records, then syncs again
+        // Only records deleted on this device (dirty) are deleted in the cloud. Missing without a delete = old copy: bring it back.
+        deletes[t] = Object.keys(sig).filter(id => !live.has(id) && dirty[id]);
+        Object.keys(sig).filter(id => !live.has(id) && !dirty[id]).forEach(id => addStale(t, id));
+        if (remaps[t]) { this.save(); return { errors, blocked: 0, remaps, stale }; } // the app re-points these records, then syncs again
       }
       // files that were removed on purpose on this device
       const fileDeletes = ctx.receiptsLoaded ? Object.keys(this.st.files).filter(k => !receipts[k]) : [];
@@ -309,7 +362,7 @@
         for (const t of ['payments', 'personal_borrowings', 'vehicle_settlements', 'debts']) {
           const ids = deletes[t]; if (!ids.length) continue;
           const { error } = await c.from(t).update({ deleted_at: now, client_updated_at: now }).in('id', ids);
-          if (error) errors++; else ids.forEach(id => { delete this.st.sig[t][id]; delete this.st.dirtyAt[id]; });
+          if (error) errors++; else ids.forEach(id => { delete this.st.sig[t][id]; MDTSync.clearDirty(this.store, id, dirty[id]); });
         }
         for (const k of fileDeletes) { const f = this.st.files[k]; const { error } = await c.from('attachments').update({ deleted_at: now, client_updated_at: now }).eq('id', f.id); if (error) { errors++; continue; } await c.storage.from(f.bucket).remove([f.path]); delete this.st.files[k]; }
         this.allowMassDelete = false;
@@ -354,7 +407,7 @@
       if (ctx.settings) { const sh = hash(stable({ m: ctx.settings.methods, p: ctx.settings.prefs })); if (sh !== this.st.settingsSig) { const { error } = await c.from('user_settings').upsert({ user_id: uid, payment_methods: ctx.settings.methods, prefs: ctx.settings.prefs }, { onConflict: 'user_id' }); if (!error) this.st.settingsSig = sh; } }
       if (ctx.markImport) await c.from('user_settings').upsert({ user_id: uid, local_import_at: now }, { onConflict: 'user_id' });
       this.save();
-      return { errors, blocked: this.blocked };
+      return { errors, blocked: this.blocked, stale };
     }
 
     // Dev-only checks for the mapping layer (run with ?test=1). Pure: no network.
@@ -380,6 +433,106 @@
       return T;
     }
   }
+  // ── Sync scenario tests: the real push/pull code against an in-memory stand-in for Supabase. Dev only (?test=1). ──
+  function fakeSupabase() {
+    const db = { T: {}, clock: Date.now() };
+    const tick = () => new Date(db.clock += 1).toISOString(), cp = x => JSON.parse(JSON.stringify(x));
+    class Q {
+      constructor(t) { this.t = t; this.op = 'select'; this.f = []; this.opts = {}; }
+      select(cols, o) { if (this.op === 'select') this.opts = o || {}; return this; }
+      eq(c, v) { this.f.push(r => r[c] === v); return this; }
+      is(c, v) { this.f.push(r => (r[c] == null ? null : r[c]) === v); return this; }
+      in(c, a) { const s = new Set(a); this.f.push(r => s.has(r[c])); return this; }
+      gte(c, v) { this.f.push(r => r[c] >= v); return this; }
+      not(c, op, list) { const s = new Set(String(list).replace(/[()]/g, '').split(',')); this.f.push(r => !s.has(r[c])); return this; }
+      order(c, o) { this.ord = [c, o && o.ascending === false ? -1 : 1]; return this; }
+      range(a, b) { this.rg = [a, b]; return this; }
+      limit(n) { this.lim = n; return this; }
+      maybeSingle() { this.single = true; return this; }
+      upsert(rows) { this.op = 'upsert'; this.rows = [].concat(rows); return this; }
+      insert(rows) { this.op = 'insert'; this.rows = [].concat(rows); return this; }
+      update(p) { this.op = 'update'; this.patch = p; return this; }
+      delete() { this.op = 'delete'; return this; }
+      then(res, rej) { let out; try { out = this.exec(); } catch (e) { return Promise.reject(e).then(res, rej); } return Promise.resolve(out).then(res, rej); }
+      exec() {
+        const tbl = db.T[this.t] || (db.T[this.t] = []), match = r => this.f.every(f => f(r));
+        if (this.op === 'upsert' || this.op === 'insert') { for (const r of this.rows) { const now = tick(), i = tbl.findIndex(x => x.id === r.id); if (i >= 0) Object.assign(tbl[i], cp(r), { updated_at: now }); else tbl.push({ created_at: now, deleted_at: null, ...cp(r), updated_at: now }); } return { data: cp(this.rows), error: null }; }
+        if (this.op === 'update') { tbl.filter(match).forEach(r => Object.assign(r, cp(this.patch), { updated_at: tick() })); return { data: null, error: null }; }
+        if (this.op === 'delete') { db.T[this.t] = tbl.filter(r => !match(r)); return { error: null }; }
+        let rows = tbl.filter(match);
+        if (this.ord) { const [k, d] = this.ord; rows.sort((a, b) => (a[k] > b[k] ? 1 : a[k] < b[k] ? -1 : 0) * d); }
+        if (this.opts.head) return { count: rows.length, data: null, error: null };
+        if (this.rg) rows = rows.slice(this.rg[0], this.rg[1] + 1);
+        if (this.lim) rows = rows.slice(0, this.lim);
+        return this.single ? { data: rows[0] ? cp(rows[0]) : null, error: null } : { data: cp(rows), error: null };
+      }
+    }
+    db.client = { from: t => new Q(t), storage: { from: () => ({ upload: async () => ({ error: null }), download: async () => ({ data: null, error: 'none' }), remove: async () => ({ error: null }) }) } };
+    return db;
+  }
+  MDTSync.scenarioTest = async function (L) {
+    const T = [], ok = (name, cond) => T.push({ name, pass: !!cond }), uid = '00000000-0000-4000-8000-0000000000aa', db = fakeSupabase();
+    const mem = () => { const m = new Map(); return { getItem: k => (m.has(k) ? m.get(k) : null), setItem: (k, v) => m.set(k, String(v)), removeItem: k => m.delete(k) }; };
+    const at = n => new Date(Date.now() + n * 60000).toISOString();
+    const dev = (store, data) => { const s = new MDTSync({}, { store }); s.client = db.client; s.useUser(uid); s.st.linked = true; s.save(); return { s, store, data: data || JSON.parse(store.getItem('app')) }; };
+    const persist = (d, prev) => { const { delta } = L.diffCollections(prev, d.data); d.store.setItem('app', JSON.stringify(L.mergeStored(JSON.parse(d.store.getItem('app') || 'null'), delta))); };
+    const change = (d, fn, when) => { const prev = d.data; d.data = { ...prev, ...fn(prev) }; MDTSync.markDirty(d.store, L.diffCollections(prev, d.data).uuids, when); persist(d, prev); };
+    const setAmt = (d, amt, when) => change(d, p => ({ debts: p.debts.map((x, i) => (i ? x : { ...x, monthlyPayment: amt })) }), when);
+    const cycle = d => d.s.run(async () => { // same order as the app: ensure ids → push → pull → apply onto current state → save
+      const prev = d.data, ids = MDTSync.ensureIds(d.data); if (ids) d.data = { ...d.data, ...ids };
+      const res = await d.s.push(d.data, {}, { receiptsLoaded: false });
+      const r = await d.s.pull(d.data, {}, res.stale || {});
+      const ap = MDTSync.applyChanges(d.data, r.changes, MDTSync.readDirty(d.store)); if (ap) d.data = { ...d.data, ...ap };
+      persist(d, prev);
+    });
+    const cloud = () => (db.T.debts || []).filter(r => !r.deleted_at).map(r => r.monthly_payment);
+    const amt = d => d.data.debts[0].monthlyPayment, pending = st => Object.keys(MDTSync.readDirty(st)).length;
+    const sA = mem(); sA.setItem('app', JSON.stringify({ debts: [{ id: 'DEBT-0001', name: 'Mazda CX-30', category: 'Car', type: 'monthly', debtType: 'monthly', monthlyPayment: 1600, firstDueDate: '2026-01-15', active: true }], payments: [], borrowings: [], settlements: [] }));
+    let A = dev(sA); await cycle(A);
+    ok('Setup: cloud has one Mazda at RM1,600', cloud().length === 1 && cloud()[0] === 1600);
+    // Regression: the exact old failure — a pull reaches the device before its edit is pushed
+    setAmt(A, 1580, at(1)); A.s.st.lastPull = {};
+    { const r = await A.s.pull(A.data, {}, {}); const ap = MDTSync.applyChanges(A.data, r.changes, MDTSync.readDirty(sA)); if (ap) A.data = { ...A.data, ...ap }; }
+    ok('Regression: local edit must not be overwritten by stale cloud sync', amt(A) === 1580 && pending(sA) === 1);
+    await cycle(A); A = dev(sA); await cycle(A);
+    ok('Test 1: cloud RM1,600 → edit RM1,580 → save → refresh = RM1,580', amt(A) === 1580 && cloud()[0] === 1580 && pending(sA) === 0);
+    setAmt(A, 1600, at(2)); A = dev(sA); await cycle(A); A = dev(sA); await cycle(A);
+    ok('Test 2: cloud RM1,580 → edit RM1,600 → save → refresh = RM1,600', amt(A) === 1600 && cloud()[0] === 1600);
+    setAmt(A, 1580, at(3)); A = dev(sA);
+    ok('Test 3a: offline edit RM1,580 survives close/reopen', amt(A) === 1580 && cloud()[0] === 1600 && pending(sA) === 1);
+    await cycle(A);
+    ok('Test 3b: back online → cloud = RM1,580, nothing pending', cloud()[0] === 1580 && amt(A) === 1580 && pending(sA) === 0);
+    setAmt(A, 1600, at(4)); await cycle(A);
+    let tabA = dev(sA, JSON.parse(sA.getItem('app'))), tabB = dev(sA, JSON.parse(sA.getItem('app')));
+    setAmt(tabA, 1580, at(5));
+    await cycle(tabB);
+    ok('Test 4a: stale Tab B (RM1,600) syncs first → Tab A’s RM1,580 is kept', JSON.parse(sA.getItem('app')).debts[0].monthlyPayment === 1580 && pending(sA) === 1 && cloud()[0] === 1600);
+    await cycle(tabA); await cycle(tabB);
+    ok('Test 4b: after both sync → cloud RM1,580 and Tab B updated to RM1,580', cloud()[0] === 1580 && amt(tabB) === 1580 && amt(tabA) === 1580);
+    setAmt(tabA, 1570, at(6));
+    change(tabB, p => ({ payments: [...p.payments, { id: 'PAY-0001', debtId: 'DEBT-0001', date: '2026-10-01', amount: 800, method: 'Bank Transfer' }] }));
+    { const st = JSON.parse(sA.getItem('app')); ok('Test 4c: stale tab saving its own change cannot revert the other tab’s edit', st.debts[0].monthlyPayment === 1570 && st.payments.length === 1); }
+    A = dev(sA); await cycle(A);
+    const sC = mem(); sC.setItem('app', JSON.stringify({ debts: [], payments: [], borrowings: [], settlements: [] }));
+    let C = dev(sC); await cycle(C);
+    ok('Second device downloads RM1,570 + the payment (no duplicates)', amt(C) === 1570 && C.data.payments.length === 1 && cloud().length === 1 && db.T.payments.length === 1);
+    setAmt(A, 1590, at(7)); setAmt(C, 1560, at(8)); await cycle(C); await cycle(A);
+    ok('Newest edit wins: later edit on device C beats older unsynced edit on A', amt(A) === 1560 && cloud()[0] === 1560 && pending(sA) === 0);
+    setAmt(C, 1550, at(9)); setAmt(A, 1545, at(10)); await cycle(C); await cycle(A); await cycle(C);
+    ok('Newest edit wins: later edit on A beats C, C updates', cloud()[0] === 1545 && amt(C) === 1545 && amt(A) === 1545);
+    setAmt(A, 1530, at(11)); setAmt(C, 1520, at(12)); await cycle(C);
+    { const r = await A.s.pull(A.data, {}, {}); setAmt(A, 1510, at(13)); const ap = MDTSync.applyChanges(A.data, r.changes, MDTSync.readDirty(sA)); if (ap) A.data = { ...A.data, ...ap }; }
+    ok('Edit made while a sync is running is not lost', amt(A) === 1510);
+    await cycle(A);
+    ok('…and it reaches the cloud on the next sync', cloud()[0] === 1510);
+    change(A, p => ({ payments: [] })); await cycle(A); await cycle(C);
+    ok('Deleting a payment soft-deletes it in the cloud and on the other device', db.T.payments[0].deleted_at && C.data.payments.length === 0 && db.T.payments.length === 1);
+    change(A, p => ({ payments: [{ id: 'PAY-0002', debtId: 'DEBT-0001', date: '2026-10-02', amount: 742.35, method: 'Cash' }] })); await cycle(A);
+    const X = dev(sA, { ...A.data, payments: [] }); await cycle(X);
+    ok('A stale copy missing a record does not delete it from the cloud', db.T.payments.filter(p => !p.deleted_at).length === 1 && X.data.payments.length === 1);
+    ok('Payment stays its original amount in the cloud', db.T.payments.find(p => !p.deleted_at).amount === 742.35);
+    return T;
+  };
   MDTSync._internals = { toRow, fromRow, rowHash, stable };
   window.MDTSync = MDTSync;
 })();

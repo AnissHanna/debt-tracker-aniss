@@ -1,7 +1,7 @@
 // My Debt Tracker service worker.
 // Caches only the app files. It never reads, clears or migrates localStorage / IndexedDB,
 // so payment records and receipt images are untouched by installs and updates.
-const VERSION = 'mdt-shell-v2';
+const VERSION = 'mdt-shell-v3';
 const RUNTIME = 'mdt-runtime';
 const SHELL = [
   './',
